@@ -8,32 +8,12 @@ from sqlalchemy import create_engine, text
 from neo4j import GraphDatabase
 from simpleeval import simple_eval
 
+import httpx
+
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from app.domain.relationships import ALLOWED_REL_TYPES
-
-# --- Optional author-edited config (shared volume) ---
-SHARED_DIR = Path(os.getenv("SHARED_DIR", "/shared"))
-CUSTOM_INVARIANTS_PATH = Path(os.getenv("CUSTOM_INVARIANTS_PATH", str(SHARED_DIR / "invariants.custom.yaml")))
-
-def _safe_yaml_load(path: Path) -> dict:
-    try:
-        if path.exists():
-            return yaml.safe_load(path.read_text()) or {}
-    except Exception:
-        # Never crash startup due to a bad custom file; UI can fix and reload.
-        return {}
-    return {}
-
-def _merge_invariants(base_cfg: dict, custom_cfg: dict) -> dict:
-    base_inv = dict((base_cfg or {}).get("invariants", {}) or {})
-    custom_inv = dict((custom_cfg or {}).get("invariants", {}) or {})
-    merged = dict(base_cfg or {})
-    merged["invariants"] = {**base_inv, **custom_inv}
-    merged["_custom_invariants_path"] = str(CUSTOM_INVARIANTS_PATH)
-    merged["_custom_invariants_count"] = len(custom_inv)
-    return merged
 
 app = FastAPI(title="Bookster Orchestrator", version="0.6.0")
 
@@ -46,21 +26,18 @@ def load_yaml(name: str) -> dict:
     return yaml.safe_load(p.read_text())
 
 runtime_cfg = load_yaml("runtime.yaml")
-
-# Invariants support a custom overlay file so non-technical authors can add/edit rules.
-_inv_cfg_base = load_yaml("invariants.yaml")
-_inv_cfg_custom = _safe_yaml_load(CUSTOM_INVARIANTS_PATH)
-inv_cfg = _merge_invariants(_inv_cfg_base, _inv_cfg_custom)
-
+inv_cfg = load_yaml("invariants.yaml")
 ctx_cfg = load_yaml("context.yaml")
 tags_cfg = load_yaml("world_state_tags.yaml")
 pov_cfg = load_yaml("pov_voice_packets.yaml")
 
-app.state.inv_cfg = inv_cfg
+# Path to invariants config (used for UI-based edits)
+INVARIANTS_PATH = Path(CONFIG_DIR) / "invariants.yaml"
 
-def get_inv_cfg() -> dict:
-    # Stored in app.state so it can be reloaded at runtime.
-    return getattr(app.state, "inv_cfg", {}) or {}
+def reload_invariants() -> None:
+    """Reload invariants.yaml into memory after UI edits."""
+    global inv_cfg
+    inv_cfg = yaml.safe_load(INVARIANTS_PATH.read_text()) if INVARIANTS_PATH.exists() else {"invariants": {}}
 
 OUT_ROOT = Path(runtime_cfg["storage"]["outputs_root"])
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -519,40 +496,201 @@ def health():
     return {"ok": True, "ts": int(time.time()), "embed_model": embed_model}
 
 
+# ---------------- Directory endpoints for author UI ----------------
 @app.get("/kg/rel-types")
 def kg_rel_types():
-    """Expose the relationship type allowlist so the UI never hard-codes it."""
+    """Return the authoritative allowlist of relationship types."""
     return {"items": sorted(list(ALLOWED_REL_TYPES))}
 
 
-@app.get("/admin/invariants")
-def admin_invariants():
-    """Return the currently-active invariant set (base + custom overlay)."""
-    cfg = get_inv_cfg()
-    return {
-        "custom_path": str(CUSTOM_INVARIANTS_PATH),
-        "custom_exists": CUSTOM_INVARIANTS_PATH.exists(),
-        "items": cfg.get("invariants", {}),
+# Backwards-compatible alias (some UIs may call underscore version)
+@app.get("/kg/rel_types")
+def kg_rel_types_alias():
+    return kg_rel_types()
+
+
+@app.get("/kg/entities")
+def kg_entities(project_id: str, q: Optional[str] = None, limit: int = 200):
+    """Fast directory service for the UI to discover entities by name/GUID."""
+    q = (q or "").strip().lower()
+    lim = max(1, min(int(limit), 500))
+
+    with driver.session() as session:
+        if q:
+            rows = session.run(
+                """
+                MATCH (e:Entity {project_id:$pid})
+                WHERE toLower(coalesce(e.name,'')) CONTAINS $q OR toLower(e.guid) CONTAINS $q
+                RETURN e.guid AS guid, e.name AS name, e.entity_type AS entity_type
+                ORDER BY e.name
+                LIMIT $lim
+                """,
+                pid=project_id,
+                q=q,
+                lim=lim,
+            ).data()
+        else:
+            rows = session.run(
+                """
+                MATCH (e:Entity {project_id:$pid})
+                RETURN e.guid AS guid, e.name AS name, e.entity_type AS entity_type
+                ORDER BY e.name
+                LIMIT $lim
+                """,
+                pid=project_id,
+                lim=lim,
+            ).data()
+
+    return {"items": rows}
+
+
+# ---------------- Invariants management (author UI) ----------------
+@app.get("/invariants/list")
+def invariants_list():
+    invs = inv_cfg.get("invariants", {}) or {}
+    return {"items": [{"name": k, **(v or {})} for k, v in sorted(invs.items())]}
+
+
+class InvariantUpsertReq(BaseModel):
+    name: str
+    invariant: Dict[str, Any]
+
+
+@app.post("/invariants/upsert")
+def invariants_upsert(req: InvariantUpsertReq):
+    """Upsert a single invariant into invariants.yaml.
+
+    This is intentionally simple and opinionated for author use. Advanced editing can still be
+    done in the YAML file directly.
+    """
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(400, "Invariant name is required")
+
+    doc = yaml.safe_load(INVARIANTS_PATH.read_text()) if INVARIANTS_PATH.exists() else {"invariants": {}}
+    doc.setdefault("invariants", {})
+    doc["invariants"][name] = req.invariant or {}
+    INVARIANTS_PATH.write_text(yaml.safe_dump(doc, sort_keys=False))
+    reload_invariants()
+    return {"status": "ok", "name": name}
+
+
+# ---------------- AI assist endpoints (optional) ----------------
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
+
+
+class AIDraftReq(BaseModel):
+    project_id: str
+    chapter_number: int
+    pov: str = "omniscient_neutral"
+    pov_guid: Optional[str] = None
+    strict_epistemic: Optional[bool] = None
+    prompt: str
+
+
+@app.post("/ai/ollama/draft")
+def ai_ollama_draft(req: AIDraftReq):
+    """Draft a scene with Ollama (local on the host).
+
+    NOTE: This assumes Ollama is reachable from Docker via host.docker.internal.
+    """
+    # Build the same bundle the author would see, and give it to the model as context.
+    bundle = context_bundle(ContextBundleReq(
+        project_id=req.project_id,
+        chapter_number=req.chapter_number,
+        pov=req.pov,
+        pov_guid=req.pov_guid,
+        strict_epistemic=req.strict_epistemic,
+    ))
+
+    system = (
+        "You are a writing assistant. Use ONLY the provided world facts and POV limits. "
+        "Do not invent new canon. If something is unknown, leave it ambiguous or propose a question."
+    )
+    user = (
+        "WORLD_CONTEXT_JSON:\n" + json.dumps(bundle, ensure_ascii=False) +
+        "\n\nSCENE_REQUEST:\n" + (req.prompt or "")
+    )
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
     }
 
+    try:
+        with httpx.Client(timeout=120) as client:
+            r = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        text_out = (data.get("message") or {}).get("content") or ""
+        return {"status": "ok", "model": OLLAMA_MODEL, "text": text_out}
+    except Exception as e:
+        raise HTTPException(502, f"Ollama draft failed: {e}")
 
-@app.post("/admin/reload-invariants")
-def admin_reload_invariants():
-    """Reload invariants.yaml and the optional shared overlay file."""
-    base = load_yaml("invariants.yaml")
-    custom = _safe_yaml_load(CUSTOM_INVARIANTS_PATH)
-    merged = _merge_invariants(base, custom)
-    app.state.inv_cfg = merged
 
-    invs = merged.get("invariants", {})
-    return {
-        "status": "ok",
-        "custom_path": str(CUSTOM_INVARIANTS_PATH),
-        "custom_exists": CUSTOM_INVARIANTS_PATH.exists(),
-        "count": len(invs),
-        "names": sorted(list(invs.keys()))[:50],
-        "note": "Reloaded invariants (base + custom overlay).",
+class AIReviewReq(BaseModel):
+    project_id: str
+    chapter_number: int
+    pov: str = "omniscient_neutral"
+    pov_guid: Optional[str] = None
+    strict_epistemic: Optional[bool] = None
+    draft_text: str
+
+
+@app.post("/ai/claude/review")
+def ai_claude_review(req: AIReviewReq):
+    """Review a draft with Claude (Anthropic API)."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(400, "ANTHROPIC_API_KEY not set")
+
+    bundle = context_bundle(ContextBundleReq(
+        project_id=req.project_id,
+        chapter_number=req.chapter_number,
+        pov=req.pov,
+        pov_guid=req.pov_guid,
+        strict_epistemic=req.strict_epistemic,
+    ))
+
+    prompt = (
+        "You are a strict narrative continuity editor.\n"
+        "Given the world context JSON and the draft, identify: (1) contradictions, (2) spoilers/leaks "
+        "under strict POV, (3) proposed canon updates needed.\n"
+        "Return: a bullet list of issues, and a bullet list of suggested proposals (entity/relationship) "
+        "in plain English (not JSON).\n\n"
+        "WORLD_CONTEXT_JSON:\n" + json.dumps(bundle, ensure_ascii=False) +
+        "\n\nDRAFT:\n" + (req.draft_text or "")
+    )
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
     }
+    body = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 1200,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        with httpx.Client(timeout=120) as client:
+            r = client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+        r.raise_for_status()
+        data = r.json()
+        # Anthropic returns content as a list of blocks
+        blocks = data.get("content", [])
+        text_out = "".join([b.get("text", "") for b in blocks if b.get("type") == "text"]) or ""
+        return {"status": "ok", "model": CLAUDE_MODEL, "text": text_out}
+    except Exception as e:
+        raise HTTPException(502, f"Claude review failed: {e}")
 
 @app.post("/projects/init")
 def init_project(req: ProjectInitReq):
@@ -592,60 +730,13 @@ def kg_upsert(payload: WorldBibleGrouped):
     total = sum(len(x) for x in [payload.characters, payload.locations, payload.factions, payload.artifacts, payload.entities])
     return {"status": "ok", "project_id": payload.project_id, "entities_upserted": total}
 
-
-# ---------------- Lightweight directory endpoints (UI support) ----------------
-
-@app.get("/kg/entities")
-def kg_entities(project_id: str, q: Optional[str] = None, limit: int = 200):
-    """Fast entity directory for the UI (search-as-you-type).
-
-    Returns items with: guid, name, entity_type.
-    """
-    q = (q or "").strip().lower()
-    lim = max(1, min(int(limit), 500))
-
-    with driver.session() as session:
-        if q:
-            rows = session.run(
-                """
-                MATCH (e:Entity {project_id:$pid})
-                WHERE toLower(e.name) CONTAINS $q OR toLower(e.guid) CONTAINS $q
-                RETURN e.guid AS guid, e.name AS name, e.entity_type AS entity_type
-                ORDER BY e.name
-                LIMIT $lim
-                """,
-                pid=project_id,
-                q=q,
-                lim=lim,
-            ).data()
-        else:
-            rows = session.run(
-                """
-                MATCH (e:Entity {project_id:$pid})
-                RETURN e.guid AS guid, e.name AS name, e.entity_type AS entity_type
-                ORDER BY e.name
-                LIMIT $lim
-                """,
-                pid=project_id,
-                lim=lim,
-            ).data()
-
-    return {"items": rows}
-
-
-@app.get("/kg/rel_types")
-def kg_rel_types():
-    """Expose the server-side relationship allowlist to the UI."""
-    # Keep it JSON-serializable and stable for the Streamlit dropdown.
-    return {"items": sorted(list(ALLOWED_REL_TYPES))}
-
 @app.post("/prose/upsert")
 def prose_upsert(req: ProseUpsertReq):
     return chroma_upsert_prose(req)
 
 @app.post("/logic/validate")
 def logic_validate(req: LogicValidateReq):
-    inv = get_inv_cfg().get("invariants", {}).get(req.invariant_name)
+    inv = inv_cfg.get("invariants", {}).get(req.invariant_name)
     if not inv:
         raise HTTPException(404, f"Unknown invariant: {req.invariant_name}")
 
@@ -839,7 +930,7 @@ def context_bundle(req: ContextBundleReq):
             "query": style_query,
             "snippets": prose_snips
         },
-        "invariants": get_inv_cfg().get("invariants", {}),
+        "invariants": inv_cfg.get("invariants", {}),
         "release_version": tags_cfg["release_gating"]["current_release_version"],
         "manifest": {
             "included": ["canon_meta", "pov_style_packet", "kg.nodes", "kg.relationships", "prose_memory.snippets", "invariants"],

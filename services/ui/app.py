@@ -1,7 +1,7 @@
 import os
 import re
 import json
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import streamlit as st
@@ -9,11 +9,10 @@ import yaml
 
 ORCH_URL = os.getenv("ORCH_URL", "http://orchestrator:8000")
 
-st.set_page_config(page_title="Bookster UI", layout="wide")
-st.title("Bookster UI (v6.2)")
+st.set_page_config(page_title="Bookster Writer UI", layout="wide")
+st.title("Bookster Writer UI (v6.3)")
 
 # ---------------- HTTP helpers ----------------
-
 def post(path: str, payload: dict, timeout: int = 30) -> httpx.Response:
     return httpx.post(f"{ORCH_URL}{path}", json=payload, timeout=timeout)
 
@@ -28,52 +27,65 @@ with st.sidebar:
     ACTIVE_PROJECT = st.text_input("Active Project ID", "my_series")
     ACTIVE_CHAPTER = st.number_input("Current Chapter", min_value=1, value=1, step=1)
 
-    if st.button("Refresh UI Data"):
-        st.cache_data.clear()
-        st.rerun()
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Refresh UI"):
+            st.cache_data.clear()
+            st.rerun()
+    with col_b:
+        st.caption("Uses cached directory calls")
 
 
 # ---------------- Cached directory lookups ----------------
 @st.cache_data(ttl=10)
-def search_entities(project_id: str, q: str = "") -> Dict[str, str]:
+def search_entities(project_id: str, q: str = "", limit: int = 200) -> Dict[str, str]:
     """Returns {guid: 'Name (type)'} for selectboxes."""
-    q = (q or "").strip()
     try:
-        r = get("/kg/entities", params={"project_id": project_id, "q": q, "limit": 200}, timeout=30)
-        if r.status_code != 200:
-            st.warning(f"Entity directory error: HTTP {r.status_code}")
-            return {}
-        items = r.json().get("items", [])
-        out: Dict[str, str] = {}
-        for e in items:
-            guid = e.get("guid")
-            if not guid:
-                continue
-            name = e.get("name") or guid
-            etype = e.get("entity_type") or "Entity"
-            out[guid] = f"{name} ({etype})"
-        return out
+        r = get("/kg/entities", params={"project_id": project_id, "q": q, "limit": limit}, timeout=20)
+        if r.status_code == 200:
+            items = r.json().get("items", [])
+            out: Dict[str, str] = {}
+            for e in items:
+                guid = e.get("guid")
+                if not guid:
+                    continue
+                name = e.get("name") or guid
+                et = e.get("entity_type") or "Entity"
+                out[guid] = f"{name} ({et})"
+            return out
+        st.warning(f"Entity directory error: HTTP {r.status_code}")
     except Exception as e:
-        st.warning(f"Cannot reach Orchestrator: {e}")
-        return {}
+        st.warning(f"Cannot reach Orchestrator (/kg/entities): {e}")
+    return {}
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=30)
 def get_rel_types() -> List[str]:
-    """Relationship allowlist provided by orchestrator (single source of truth)."""
+    """Authoritative relationship allowlist from the orchestrator."""
     try:
-        r = get("/kg/rel-types", timeout=30)
-        if r.status_code != 200:
-            st.warning(f"Relationship allowlist error: HTTP {r.status_code}")
-            return ["KNOWS"]
-        items = r.json().get("items", [])
-        return [str(x) for x in items]
-    except Exception as e:
-        st.warning(f"Cannot reach Orchestrator for relationship types: {e}")
-        return ["KNOWS"]
+        r = get("/kg/rel_types", timeout=15)
+        if r.status_code == 200:
+            return r.json().get("items", [])
+        # fallback to the other spelling
+        r2 = get("/kg/rel-types", timeout=15)
+        if r2.status_code == 200:
+            return r2.json().get("items", [])
+    except Exception:
+        pass
+
+    # No local fallback: domain is authoritative.
+    return []
 
 
-REL_TYPES = get_rel_types()
+@st.cache_data(ttl=10)
+def list_invariants() -> List[Dict[str, Any]]:
+    try:
+        r = get("/invariants/list", timeout=15)
+        if r.status_code == 200:
+            return r.json().get("items", [])
+    except Exception:
+        pass
+    return []
 
 
 # ---------------- Tabs ----------------
@@ -83,18 +95,18 @@ tabs = st.tabs([
     "World Zero Upsert",
     "Prose Memory",
     "Proposals",
-    "Context Bundle",
+    "Context Bundle + AI",
     "Logic Validator",
 ])
 
 
 # ---------------- Tab 0: Health ----------------
 with tabs[0]:
-    st.subheader("Health")
-    if st.button("Health Check"):
+    st.subheader("Service health")
+    if st.button("Run health check"):
         try:
-            r = get("/health")
-            st.write(r.status_code)
+            r = get("/health", timeout=10)
+            st.write(f"HTTP {r.status_code}")
             if r.headers.get("content-type", "").startswith("application/json"):
                 st.json(r.json())
             else:
@@ -105,22 +117,26 @@ with tabs[0]:
 
 # ---------------- Tab 1: Project Init ----------------
 with tabs[1]:
-    st.subheader("Initialize Project")
+    st.subheader("Initialize a project")
     project_id = st.text_input("Project ID", ACTIVE_PROJECT)
     title = st.text_input("Title", "My Series")
     premise = st.text_area("Premise", "A hidden heir discovers a world-law that breaks the empire.")
     genre = st.text_input("Genre", "fantasy")
 
-    if st.button("Create Project"):
-        r = post("/projects/init", {"project_id": project_id, "title": title, "premise": premise, "genre": genre})
-        st.write(r.status_code)
+    if st.button("Create / Initialize"):
+        r = post(
+            "/projects/init",
+            {"project_id": project_id, "title": title, "premise": premise, "genre": genre},
+            timeout=30,
+        )
+        st.write(f"HTTP {r.status_code}")
         st.json(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text})
 
 
 # ---------------- Tab 2: World Zero Upsert ----------------
 with tabs[2]:
-    st.subheader("World Zero Upsert (YAML → /kg/upsert)")
-    st.caption("Seed your initial world bible. Tip: keep secrets as UNREVEALED until the reveal chapter.")
+    st.subheader("World Zero seed (YAML → /kg/upsert)")
+    st.caption("This seeds your Knowledge Graph. After this, the UI can search entities by name.")
 
     default_yaml = f"""project_id: {ACTIVE_PROJECT}
 characters:
@@ -129,6 +145,7 @@ characters:
     valid_from_chapter: 1
     reveal_tag: REVEALED
     relationships:
+      # Aragorn learns the secret at Chapter 10
       - target: PLOT_TRUE_HEIR
         type: KNOWS
         from_chapter: 10
@@ -147,7 +164,8 @@ entities:
 """
 
     world_yaml = st.text_area("world_zero.yaml", default_yaml, height=320)
-    if st.button("Upsert KG"):
+
+    if st.button("Upsert World Zero"):
         try:
             payload = yaml.safe_load(world_yaml)
         except Exception as e:
@@ -155,24 +173,24 @@ entities:
             st.stop()
 
         r = post("/kg/upsert", payload, timeout=60)
-        st.write(r.status_code)
+        st.write(f"HTTP {r.status_code}")
         st.json(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text})
 
 
 # ---------------- Tab 3: Prose Memory ----------------
 with tabs[3]:
-    st.subheader("Prose Memory (Style Continuity)")
-    project_id = st.text_input("Project ID (prose)", ACTIVE_PROJECT)
-    chapter_number = st.number_input("Chapter #", min_value=0, value=int(ACTIVE_CHAPTER), step=1)
-    pov = st.text_input("POV label", "omniscient_neutral")
-    label = st.text_input("Label", "ch1_opening")
-    text = st.text_area("Prose text to store", "The rain came down like a verdict...", height=180)
+    st.subheader("Prose Memory (style continuity)")
 
-    if st.button("Upsert Prose Snippet"):
+    chapter_number = st.number_input("Chapter #", min_value=0, value=int(ACTIVE_CHAPTER), step=1)
+    pov = st.text_input("POV label (optional)", "omniscient_neutral")
+    label = st.text_input("Label", "ch1_opening")
+    text = st.text_area("Paste a passage you love", "The rain came down like a verdict...", height=180)
+
+    if st.button("Save snippet"):
         r = post(
             "/prose/upsert",
             {
-                "project_id": project_id,
+                "project_id": ACTIVE_PROJECT,
                 "chapter_number": int(chapter_number),
                 "pov": pov,
                 "label": label,
@@ -180,55 +198,61 @@ with tabs[3]:
             },
             timeout=60,
         )
-        st.write(r.status_code)
+        st.write(f"HTTP {r.status_code}")
         st.json(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text})
 
 
 # ---------------- Tab 4: Proposals ----------------
 with tabs[4]:
-    st.subheader("Proposals (Author-Friendly)")
-    st.caption("Add facts without typing JSON or memorizing GUIDs.")
+    st.subheader("Proposals (author-friendly governance)")
+    st.caption("Create or approve changes without writing JSON or memorizing GUIDs.")
 
     # Queue
     st.markdown("### Queue")
     status_filter = st.selectbox("Queue filter", ["PENDING", "APPROVED", "REJECTED"], index=0)
-    r_list = get("/proposals/list", params={"project_id": ACTIVE_PROJECT, "status": status_filter}, timeout=30)
+    try:
+        r_list = get("/proposals/list", params={"project_id": ACTIVE_PROJECT, "status": status_filter}, timeout=20)
+    except Exception as e:
+        st.error(f"Cannot load proposals: {e}")
+        r_list = None
 
-    if r_list.status_code == 200:
-        items = r_list.json().get("items", [])
-        if not items:
-            st.info("No proposals in this filter.")
-        for item in items:
-            with st.expander(f"Proposal #{item['id']} — {item['kind'].upper()} — {item['status']}"):
-                st.json(item["payload"])
-                if item["status"] == "PENDING":
-                    if st.button(f"Approve #{item['id']}", key=f"approve_{item['id']}"):
-                        r = post("/proposals/approve", {"id": item["id"]}, timeout=30)
-                        if r.status_code == 200:
-                            st.success("Approved.")
-                            st.rerun()
-                        else:
-                            st.error(f"Approve failed: {r.status_code}")
-                            st.write(r.text)
-    else:
-        st.error(f"Failed to load proposals: {r_list.status_code}")
-        st.write(r_list.text)
+    if r_list is not None:
+        if r_list.status_code == 200:
+            items = r_list.json().get("items", [])
+            if not items:
+                st.info("No proposals in this filter.")
+            for item in items:
+                with st.expander(f"Proposal #{item['id']} — {item['kind'].upper()} — {item['status']}"):
+                    st.json(item.get("payload", {}))
+                    if item["status"] == "PENDING":
+                        if st.button(f"Approve #{item['id']}", key=f"approve_{item['id']}"):
+                            rr = post("/proposals/approve", {"id": item["id"]}, timeout=30)
+                            if rr.status_code == 200:
+                                st.success("Approved.")
+                                st.cache_data.clear()
+                                st.rerun()
+                            else:
+                                st.error(f"Approve failed: HTTP {rr.status_code}")
+                                st.code(rr.text)
+        else:
+            st.error(f"Failed to load proposals: HTTP {r_list.status_code}")
+            st.code(r_list.text)
 
     st.divider()
 
-    # Create proposals
-    st.markdown("### Create a new proposal")
+    # Create
+    st.markdown("### Create a proposal")
     mode = st.radio("What are you adding?", ["Entity", "Relationship"], horizontal=True)
     trust_tier = st.selectbox("Trust tier", [1, 2, 3], index=1, help="1=minor, 2=normal, 3=canon-shifting")
 
     if mode == "Entity":
         with st.form("entity_form"):
-            e_name = st.text_input("Name")
+            e_name = st.text_input("Name", "")
             e_type = st.selectbox("Type", ["character", "location", "faction", "artifact", "entity"], index=0)
-            e_guid = st.text_input("Internal ID (optional)", help="Leave blank to auto-generate from name.")
-            e_desc = st.text_area("Description / notes (optional)")
+            e_guid = st.text_input("Internal ID (optional)", "", help="Leave blank to auto-generate from name.")
+            e_desc = st.text_area("Description / notes (optional)", "")
 
-            if st.form_submit_button("Submit entity proposal"):
+            if st.form_submit_button("Submit entity"):
                 if not e_name.strip():
                     st.error("Name is required.")
                     st.stop()
@@ -261,24 +285,30 @@ with tabs[4]:
                 if r.status_code == 200:
                     st.success("Entity proposal submitted.")
                     st.json(r.json())
+                    st.cache_data.clear()
                 else:
-                    st.error(f"Failed: {r.status_code}")
-                    st.write(r.text)
+                    st.error(f"Failed: HTTP {r.status_code}")
+                    st.code(r.text)
 
     else:
-        with st.form("rel_form"):
-            st.caption("Search entities by name. The dropdown is powered by your knowledge graph.")
+        rel_types = get_rel_types()
+        if not rel_types:
+            st.error("Cannot load relationship types from the Orchestrator. Is it running and updated (v6.3)?")
+            st.stop()
 
-            q_src = st.text_input("Search source")
+        with st.form("rel_form"):
+            st.caption("Search entities by name.")
+
+            q_src = st.text_input("Search source", "")
             src_map = search_entities(ACTIVE_PROJECT, q_src)
             if not src_map:
-                st.warning("No entities found. Seed World Zero first (Tab 3).")
+                st.warning("No entities found. Seed World Zero first (Tab 2).")
                 st.stop()
             src = st.selectbox("Source", options=list(src_map.keys()), format_func=lambda x: src_map[x])
 
-            rel_type = st.selectbox("Relationship type", REL_TYPES)
+            rel_type = st.selectbox("Relationship type", rel_types)
 
-            q_tgt = st.text_input("Search target")
+            q_tgt = st.text_input("Search target", "")
             tgt_map = search_entities(ACTIVE_PROJECT, q_tgt)
             if not tgt_map:
                 st.warning("No entities found for target search.")
@@ -287,7 +317,8 @@ with tabs[4]:
 
             from_ch = st.number_input("From chapter", min_value=1, value=int(ACTIVE_CHAPTER), step=1)
 
-            if st.form_submit_button("Submit relationship proposal"):
+            if st.form_submit_button("Submit relationship"):
+                # Guardrail is author-side only; backend still enforces.
                 if src == tgt and rel_type != "KNOWS":
                     st.error("Invalid: relationship cannot point to itself (except KNOWS).")
                     st.stop()
@@ -313,31 +344,35 @@ with tabs[4]:
                 if r.status_code == 200:
                     st.success("Relationship proposal submitted.")
                     st.json(r.json())
+                    st.cache_data.clear()
                 else:
-                    st.error(f"Failed: {r.status_code}")
-                    st.write(r.text)
+                    st.error(f"Failed: HTTP {r.status_code}")
+                    st.code(r.text)
 
 
-# ---------------- Tab 5: Context Bundle ----------------
+# ---------------- Tab 5: Context Bundle + AI ----------------
 with tabs[5]:
     st.subheader("Context Bundle")
-    st.caption("Strict mode filters spoilers based on KNOWS edges + reveal tags.")
+    st.caption("Strict mode filters spoilers based on KNOWS edges.")
 
     pov_style = st.selectbox("Narrative voice", ["omniscient_neutral", "deep_third", "first_person_past"], index=0)
     strict = st.checkbox("Strict POV knowledge (filter spoilers)", value=True)
 
     pov_guid = None
     if strict:
-        q_pov = st.text_input("Search POV character")
+        q_pov = st.text_input("Search POV character", "")
         pov_map = search_entities(ACTIVE_PROJECT, q_pov)
-        if not pov_map:
-            st.warning("No entities found. Seed World Zero first (Tab 3).")
-        else:
+        if pov_map:
             pov_guid = st.selectbox("POV character", options=list(pov_map.keys()), format_func=lambda x: pov_map[x])
+        else:
+            st.warning("No entities found. Seed World Zero first (Tab 2).")
 
-    style_query = st.text_input("Optional style query override (usually leave blank)")
+    style_query = st.text_input("Optional style query override (usually blank)", "")
 
-    if st.button("Build bundle"):
+    if "bundle" not in st.session_state:
+        st.session_state.bundle = None
+
+    if st.button("Build context bundle"):
         if strict and not pov_guid:
             st.error("Strict mode requires selecting a POV character.")
             st.stop()
@@ -356,201 +391,204 @@ with tabs[5]:
         st.write(f"HTTP {r.status_code}")
 
         if r.headers.get("content-type", "").startswith("application/json"):
-            bundle = r.json()
-
-            nodes = bundle.get("kg", {}).get("nodes", [])
-            rels = bundle.get("kg", {}).get("relationships", [])
-            name_map = {n.get("guid"): n.get("name", n.get("guid")) for n in nodes if n.get("guid")}
-
-            st.success("Bundle ready")
-            st.markdown("### Active relationships")
-            if not rels:
-                st.info("No relationships visible under this POV at this chapter.")
-            for rel in rels:
-                s = name_map.get(rel["source"], rel["source"])
-                t = name_map.get(rel["target"], rel["target"])
-                st.info(f"{s} ➔ {rel['type']} ➔ {t}")
-
-            with st.expander("Raw bundle (debug)"):
-                st.json(bundle)
+            st.session_state.bundle = r.json()
         else:
-            st.error("Non-JSON response from orchestrator:")
-            st.write(r.text)
+            st.session_state.bundle = None
+            st.error("Non-JSON response from orchestrator")
+            st.code(r.text)
+
+    bundle = st.session_state.bundle
+    if bundle:
+        nodes = bundle.get("kg", {}).get("nodes", [])
+        rels = bundle.get("kg", {}).get("relationships", [])
+        name_map = {n.get("guid"): n.get("name", n.get("guid")) for n in nodes if n.get("guid")}
+
+        st.success("Bundle ready")
+        st.markdown("### Active relationships")
+        if not rels:
+            st.info("No relationships visible under this POV at this chapter.")
+        for rel in rels:
+            s = name_map.get(rel["source"], rel["source"])
+            t = name_map.get(rel["target"], rel["target"])
+            st.info(f"{s} ➔ {rel['type']} ➔ {t}")
+
+        with st.expander("Raw bundle (debug)"):
+            st.json(bundle)
+
+    st.divider()
+
+    # -------- AI Assist (Ollama draft, Claude review) --------
+    st.subheader("AI Assist")
+    st.caption("Draft locally with Ollama, then review with Claude. Both use the current Context Bundle.")
+
+    if "draft_text" not in st.session_state:
+        st.session_state.draft_text = ""
+    if "review_text" not in st.session_state:
+        st.session_state.review_text = ""
+
+    scene_prompt = st.text_area(
+        "What should happen in this scene?",
+        "Rowan crosses the city at night and senses something wrong in the air.",
+        height=120,
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Draft with Ollama"):
+            if not bundle:
+                st.error("Build a context bundle first.")
+                st.stop()
+            r = post(
+                "/ai/ollama/draft",
+                {"context": bundle, "prompt": scene_prompt, "temperature": 0.7},
+                timeout=120,
+            )
+            if r.status_code == 200:
+                st.session_state.draft_text = r.json().get("text", "")
+            else:
+                st.error(f"Ollama draft failed: HTTP {r.status_code}")
+                st.code(r.text)
+
+    with col2:
+        if st.button("Review with Claude"):
+            if not bundle:
+                st.error("Build a context bundle first.")
+                st.stop()
+            if not st.session_state.draft_text.strip():
+                st.error("Draft with Ollama first (or paste a draft below).")
+                st.stop()
+            r = post(
+                "/ai/claude/review",
+                {"context": bundle, "draft": st.session_state.draft_text, "instructions": "Find continuity issues, spoilers, and propose fixes."},
+                timeout=120,
+            )
+            if r.status_code == 200:
+                st.session_state.review_text = r.json().get("text", "")
+            else:
+                st.error(f"Claude review failed: HTTP {r.status_code}")
+                st.code(r.text)
+
+    st.markdown("### Draft")
+    st.session_state.draft_text = st.text_area("Draft text", st.session_state.draft_text, height=220)
+
+    st.markdown("### Review")
+    st.text_area("Review notes", st.session_state.review_text, height=220)
 
 
-# ---------------- Tab 6: Logic Validator + Invariant Editor ----------------
+# ---------------- Tab 6: Logic Validator ----------------
 with tabs[6]:
-    st.subheader("🛡️ Logic & Rules")
+    st.subheader("Logic Validator")
+    st.caption("Use Simple Form mode to avoid JSON. Advanced mode remains available.")
 
-    sub = st.tabs(["Validate a Scene", "Edit Invariants (No Code)"])
+    inv_items = list_invariants()
+    inv_names = [i.get("name") for i in inv_items if i.get("name")]
 
-    # ------- Subtab: Validate -------
-    with sub[0]:
-        st.caption("Simple Form mode avoids JSON for common checks. Advanced mode accepts raw Scene JSON.")
+    mode = st.radio("Mode", ["Simple Form", "Advanced JSON"], horizontal=True)
 
-        # You can expand this map over time. These are UI-only helpers; the *real* invariant lives in orchestrator YAML.
-        COMMON_INVARIANTS = {
-            "teleportation_allowed": {
-                "teleportation_used": ("bool", False),
-            },
+    # ----- Validator: Simple form -----
+    if mode == "Simple Form":
+        invariant_name = st.selectbox("Invariant", inv_names or [""], index=0)
+
+        st.markdown("### Scene form")
+        scene_type = st.selectbox("Scene type", ["combat"], index=0)
+
+        # v6.3 scope: Combat scene
+        weapon_drawn = st.checkbox("Weapon drawn", value=False)
+        magic_used = st.checkbox("Magic used", value=False)
+        character_injured = st.checkbox("Character injured", value=False)
+
+        enemies_count = st.number_input("Enemies count", min_value=0, value=0, step=1)
+        mana_spent = st.number_input("Mana spent", min_value=0, value=0, step=1)
+
+        scene_obj = {
+            "scene_type": scene_type,
+            "weapon_drawn": bool(weapon_drawn),
+            "magic_used": bool(magic_used),
+            "character_injured": bool(character_injured),
+            "enemies": int(enemies_count),
+            "mana_spent": int(mana_spent),
         }
 
-        mode = st.radio("Input mode", ["Simple Form", "Advanced JSON"], horizontal=True)
-        invariant = st.text_input("Invariant name", "teleportation_allowed")
+        with st.expander("Generated JSON (read-only)"):
+            st.json(scene_obj)
 
-        scene: Optional[dict] = None
+        if st.button("Validate"):
+            if not invariant_name:
+                st.error("No invariants available. Add one below (Manage Invariants).")
+                st.stop()
+            r = post("/logic/validate", {"invariant_name": invariant_name, "scene": scene_obj}, timeout=30)
+            st.write(f"HTTP {r.status_code}")
+            st.json(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text})
 
-        if mode == "Simple Form":
-            spec = COMMON_INVARIANTS.get(invariant)
-            if not spec:
-                st.info(
-                    "No simple form is configured for this invariant yet. "
-                    "Use Advanced JSON, or add a form template in app.py (COMMON_INVARIANTS)."
-                )
-            else:
-                st.markdown("### Scene inputs")
-                scene = {}
-                for field, (ftype, default) in spec.items():
-                    if ftype == "bool":
-                        scene[field] = st.checkbox(field, value=bool(default), key=f"inv_{invariant}_{field}")
-                    elif ftype == "int":
-                        scene[field] = int(st.number_input(field, value=int(default), step=1, key=f"inv_{invariant}_{field}"))
-                    elif ftype == "float":
-                        scene[field] = float(st.number_input(field, value=float(default), step=0.1, key=f"inv_{invariant}_{field}"))
-                    elif ftype == "str":
-                        scene[field] = st.text_input(field, value=str(default), key=f"inv_{invariant}_{field}")
-                    else:
-                        st.warning(f"Unsupported field type '{ftype}' for '{field}'.")
+    # ----- Validator: Advanced JSON -----
+    else:
+        invariant_name = st.text_input("Invariant name", "")
+        scene_json = st.text_area("Scene JSON", '{"scene_type":"combat","weapon_drawn":true,"magic_used":false,"enemies":3,"mana_spent":0}', height=160)
 
-                with st.expander("Show generated Scene JSON"):
-                    st.code(json.dumps(scene, indent=2), language="json")
+        if st.button("Validate (Advanced)"):
+            try:
+                scene = json.loads(scene_json)
+            except Exception as e:
+                st.error(f"Invalid JSON: {e}")
+                st.stop()
 
-            if st.button("Validate", key="validate_form"):
-                if scene is None:
-                    st.error("No form available for this invariant. Switch to Advanced JSON.")
-                    st.stop()
-                r = post("/logic/validate", {"invariant_name": invariant, "scene": scene}, timeout=30)
-                st.write(r.status_code)
-                st.json(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text})
+            r = post("/logic/validate", {"invariant_name": invariant_name, "scene": scene}, timeout=30)
+            st.write(f"HTTP {r.status_code}")
+            st.json(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text})
 
-        else:
-            scene_json = st.text_area("Scene JSON", '{"teleportation_used": true}', height=160)
-            if st.button("Validate", key="validate_json"):
-                try:
-                    scene = json.loads(scene_json)
-                except Exception as e:
-                    st.error(f"Invalid JSON: {e}")
-                    st.stop()
-                r = post("/logic/validate", {"invariant_name": invariant, "scene": scene}, timeout=30)
-                st.write(r.status_code)
-                st.json(r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text})
+    st.divider()
 
-    # ------- Subtab: Edit invariants -------
-    with sub[1]:
-        st.caption(
-            "Create or edit invariants from the UI. These are stored in a shared file and reloaded by the orchestrator."
+    # ----- Invariants editor (author-controlled) -----
+    st.subheader("Manage invariants")
+    st.caption("Create or update invariants from the UI. This writes to invariants.yaml in the Orchestrator container.")
+
+    with st.expander("Create / Update invariant"):
+        existing = {i.get("name"): i for i in inv_items if i.get("name")}
+        pick = st.selectbox("Load existing (optional)", ["(new)"] + sorted(existing.keys()))
+
+        seed = existing.get(pick) if pick and pick != "(new)" else {}
+
+        inv_name = st.text_input("Name", seed.get("name", ""))
+        inv_sev = st.selectbox("Severity", ["OK", "INFO", "WARN", "BLOCKER"], index=["OK", "INFO", "WARN", "BLOCKER"].index(seed.get("severity", "BLOCKER")) if seed.get("severity", "BLOCKER") in ["OK", "INFO", "WARN", "BLOCKER"] else 3)
+        inv_rule = st.text_input("Rule expression (simple_eval)", seed.get("rule", ""), help="Return True to mark violated.")
+        inv_why = st.text_area("Why (message)", seed.get("why", "Invariant violated."), height=80)
+        inv_suggestions = st.text_area("Suggestions (one per line)", "\n".join(seed.get("suggestions", []) or []), height=120)
+
+        variables_yaml = st.text_area(
+            "Variables mapping (optional YAML)",
+            yaml.safe_dump(seed.get("variables", {}) or {}, sort_keys=False) if seed else "{}\n",
+            height=140,
+            help="Example: teleport_used: ${scene.teleportation_used}",
         )
 
-        CUSTOM_INVARIANTS_PATH = os.getenv("CUSTOM_INVARIANTS_PATH", "/shared/invariants.custom.yaml")
-
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            if st.button("Reload invariants in Orchestrator"):
-                r = post("/admin/reload-invariants", {}, timeout=30)
-                if r.status_code == 200:
-                    st.success("Reloaded.")
-                    st.json(r.json())
-                else:
-                    st.error(f"Reload failed: HTTP {r.status_code}")
-                    st.write(r.text)
-
-        with col_b:
-            if st.button("View current invariants (merged)"):
-                r = get("/admin/invariants", timeout=30)
-                if r.status_code == 200:
-                    invs = r.json().get("invariants", {})
-                    st.write(f"Loaded invariants: {len(invs)}")
-                    with st.expander("Show all invariants"):
-                        st.json(invs)
-                else:
-                    st.error(f"Cannot fetch invariants: HTTP {r.status_code}")
-                    st.write(r.text)
-
-        st.divider()
-
-        def _load_custom() -> dict:
-            try:
-                if os.path.exists(CUSTOM_INVARIANTS_PATH):
-                    with open(CUSTOM_INVARIANTS_PATH, "r", encoding="utf-8") as f:
-                        data = yaml.safe_load(f.read()) or {}
-                        return data
-            except Exception as e:
-                st.warning(f"Could not read custom invariants: {e}")
-            return {}
-
-        def _save_custom(data: dict) -> None:
-            os.makedirs(os.path.dirname(CUSTOM_INVARIANTS_PATH), exist_ok=True)
-            with open(CUSTOM_INVARIANTS_PATH, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
-
-        custom_doc = _load_custom()
-        custom_invs = (custom_doc or {}).get("invariants", {}) or {}
-
-        st.markdown("### Edit custom invariants")
-        existing = [""] + sorted(custom_invs.keys())
-        pick = st.selectbox("Edit existing (optional)", options=existing)
-
-        seed = custom_invs.get(pick, {}) if pick else {}
-
-        with st.form("inv_editor"):
-            inv_name = st.text_input("Invariant name", value=pick or "")
-            severity = st.selectbox("Severity", ["OK", "INFO", "WARN", "BLOCKER"], index=3)
-            rule = st.text_input("Rule (expression)", value=str(seed.get("rule", "")))
-            why = st.text_area("Why (message shown when violated)", value=str(seed.get("why", "")), height=80)
-
-            variables_yaml = st.text_area(
-                "Variables (YAML map)",
-                value=yaml.safe_dump(seed.get("variables", {}) or {}, sort_keys=False),
-                height=140,
-                help="Example: mana_spent: ${scene.mana_spent}"
-            )
-            suggestions_txt = st.text_area(
-                "Suggestions (one per line)",
-                value="\n".join(seed.get("suggestions", []) or []),
-                height=100,
-            )
-
-            save = st.form_submit_button("Save to custom invariants")
-
-        if save:
-            name = (inv_name or "").strip()
-            if not name:
-                st.error("Invariant name is required.")
+        if st.button("Save invariant"):
+            if not inv_name.strip():
+                st.error("Name is required.")
                 st.stop()
-            if not rule.strip():
-                st.error("Rule is required.")
-                st.stop()
-
             try:
                 variables = yaml.safe_load(variables_yaml) or {}
                 if not isinstance(variables, dict):
-                    raise ValueError("Variables must be a YAML map (key: value).")
+                    raise ValueError("Variables must be a YAML mapping")
             except Exception as e:
-                st.error(f"Invalid Variables YAML: {e}")
+                st.error(f"Invalid variables YAML: {e}")
                 st.stop()
 
-            suggestions = [ln.strip() for ln in (suggestions_txt or "").splitlines() if ln.strip()]
-
-            custom_invs[name] = {
-                "severity": severity,
-                "variables": variables,
-                "rule": rule.strip(),
-                "why": why.strip() or "Invariant violated.",
-                "suggestions": suggestions,
+            payload = {
+                "name": inv_name.strip(),
+                "invariant": {
+                    "severity": inv_sev,
+                    "variables": variables,
+                    "rule": inv_rule.strip(),
+                    "why": inv_why.strip(),
+                    "suggestions": [s.strip() for s in inv_suggestions.splitlines() if s.strip()],
+                },
             }
 
-            new_doc = dict(custom_doc or {})
-            new_doc["invariants"] = custom_invs
-            _save_custom(new_doc)
-            st.success(f"Saved '{name}' to {CUSTOM_INVARIANTS_PATH}")
-            st.info("Next: click 'Reload invariants in Orchestrator' above.")
+            r = post("/invariants/upsert", payload, timeout=30)
+            if r.status_code == 200:
+                st.success("Saved.")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(f"Save failed: HTTP {r.status_code}")
+                st.code(r.text)

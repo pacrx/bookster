@@ -1,26 +1,25 @@
 project_id: my_series
 
 characters:
-  - guid: CHAR_ARAGORN
-    name: Aragorn
+  - guid: CHAR_TEST_POV
+    name: Test POV character
     valid_from_chapter: 1
     reveal_tag: REVEALED
     relationships:
-      # Aragorn learns this plot point in Chapter 10
-      - target: PLOT_TRUE_HEIR
+      # Test POV character learns the truth in Chapter 10
+      - target: PLOT_SECRET
         type: KNOWS
         from_chapter: 10
 
 locations:
-  - guid: LOC_MINAS_TIRITH
-    name: Minas Tirith
+  - guid: LOC_HOME
+    name: Dream Park
     valid_from_chapter: 1
-    reveal_tag: REVEALED
 
-# Use entities for plot points, secrets, laws of magic, etc.
+# Plot points / secrets / lore objects live here (keeps character list clean)
 entities:
-  - guid: PLOT_TRUE_HEIR
-    name: The True Heir
+  - guid: PLOT_SECRET
+    name: Placeholder Secret
     valid_from_chapter: 1
     reveal_tag: UNREVEALED
     reveal_from_chapter: 10

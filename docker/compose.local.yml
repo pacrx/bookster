@@ -29,7 +29,7 @@ services:
       test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:7474 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 12
     volumes:
       - neo4j_data:/data
     healthcheck:
