@@ -1,0 +1,24 @@
+invariants:
+  teleportation_allowed:
+    severity: BLOCKER
+    explain: true
+    variables:
+      allowed: false
+      used: "${scene.teleportation_used}"
+    rule: "used and (not allowed)"
+    why: "Teleportation is disallowed by world invariants."
+    suggestions:
+      - "Rewrite scene without teleportation or change invariant (Tier 3)."
+
+  teleportation_life_cost:
+    severity: BLOCKER
+    explain: true
+    variables:
+      teleports: "${scene.teleports_in_scene}"
+      cost: 10
+      remaining: "${scene.remaining_life_years}"
+      total_cost: "teleports * cost"
+    rule: "(teleports > 1) or (total_cost > remaining)"
+    why: "Teleportation violates max-per-scene or exceeds remaining lifespan."
+    suggestions:
+     - "Reduce teleport count, reduce cost (Tier 3), or change lifespan via canon delta (Tier 2/3)."

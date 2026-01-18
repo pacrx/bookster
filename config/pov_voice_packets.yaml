@@ -1,0 +1,6 @@
+packets:
+  omniscient_neutral:
+    lexicon: { preferred: [], avoid: [] }
+    cadence: { sentence_length: "medium", punctuation: "balanced" }
+    metaphor_palette: []
+    bias_notes: []

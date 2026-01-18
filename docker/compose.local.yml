@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: book
+      POSTGRES_PASSWORD: bookpass
+      POSTGRES_DB: narrative
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U book -d narrative"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: "neo4j/neo4jpass"
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  chroma:
+    image: chromadb/chroma:0.5.5
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  orchestrator:
+    build: ../services/orchestrator
+    env_file: ../.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ./shared:/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+
+  ui:
+    build: ../services/ui
+    env_file: ../.env
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ./shared:/shared
+    depends_on:
+      - orchestrator
+
+volumes:
+  pg_data:
+  neo4j_data:
+  chroma_data:

@@ -1,0 +1,26 @@
+project_id: my_series
+
+characters:
+  - guid: CHAR_ARAGORN
+    name: Aragorn
+    valid_from_chapter: 1
+    reveal_tag: REVEALED
+    relationships:
+      # Aragorn learns this plot point in Chapter 10
+      - target: PLOT_TRUE_HEIR
+        type: KNOWS
+        from_chapter: 10
+
+locations:
+  - guid: LOC_MINAS_TIRITH
+    name: Minas Tirith
+    valid_from_chapter: 1
+    reveal_tag: REVEALED
+
+# Use entities for plot points, secrets, laws of magic, etc.
+entities:
+  - guid: PLOT_TRUE_HEIR
+    name: The True Heir
+    valid_from_chapter: 1
+    reveal_tag: UNREVEALED
+    reveal_from_chapter: 10

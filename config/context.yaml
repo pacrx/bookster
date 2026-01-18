@@ -1,0 +1,7 @@
+time_slicing:
+  enabled: true
+  chapter_index_field: "chapter_number"
+
+epistemic_filtering:
+  enabled: true
+  strict: true

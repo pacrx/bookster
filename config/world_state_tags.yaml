@@ -1,0 +1,6 @@
+tags:
+  activity: [ACTIVE, DORMANT]
+  reveal: [REVEALED, UNREVEALED]
+
+release_gating:
+  current_release_version: "V1_DRAFT"
