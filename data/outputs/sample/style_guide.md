@@ -1,0 +1,1 @@
+Write in clear prose. Preserve POV voice. No new canon facts without approval.
