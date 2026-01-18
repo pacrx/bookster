@@ -1,3 +1,4 @@
+APP_VERSION = "v6.4-author-stable"
 from __future__ import annotations
 
 import os
@@ -515,7 +516,7 @@ def build_style_query(req: ContextBundleReq, kg_view: dict) -> str:
 # ---------------- Endpoints ----------------
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": int(time.time()), "embed_model": embed_model}
+    return {"ok": True, "ts": int(time.time()), "version": APP_VERSION, "embed_model": embed_model}
 
 @app.get("/kg/rel_types")
 def kg_rel_types():

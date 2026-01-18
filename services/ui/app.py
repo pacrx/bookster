@@ -10,7 +10,7 @@ import yaml
 ORCH_URL = os.getenv("ORCH_URL", "http://orchestrator:8000")
 
 st.set_page_config(page_title="Bookster UI", layout="wide")
-st.title("Bookster UI (v6.4)")
+st.title("Bookster UI - v6.4 (Author stable)")
 
 # ---------------- HTTP helpers ----------------
 
